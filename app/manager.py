@@ -17,10 +17,16 @@ later job skips the baseline entirely.
 
 Cancellation
 ------------
-A job is only reported ``cancelled`` after its worker process (if any) has
+A job is only reported ``cancelled`` after the process it depends on has
 exited and been reaped and its files have been cleaned up.  Every phase
 handoff re-checks the flag under the lock, so a cancel racing with completion
 neither starts the anomaly phase nor publishes a late result.
+
+For the *last* waiter of a shared baseline run the cancellation is two-stage:
+the job becomes ``cancelling`` (and keeps occupying its slot) while the shared
+worker is terminated, reaped and its artifacts removed; only when the run is
+fully closed does the job become ``cancelled``.  Repeated cancel requests while
+this teardown is in flight are no-ops and can never finalize the job early.
 """
 
 from __future__ import annotations
@@ -63,6 +69,10 @@ class JobRecord:
     message: str = "accepted; waiting for baseline climatology"
     proc: asyncio.subprocess.Process | None = None
     baseline_active: bool = False
+    # The shared baseline run this job is currently waiting on (if any).  When
+    # the last attached waiter cancels, this is the run whose exit/reap/cleanup
+    # must complete before the job may become ``cancelled``.
+    baseline_run: "BaselineRun | None" = None
     supervisor: asyncio.Task | None = None
     cancel_file: Path | None = None
     baseline_attempts: int = 0
@@ -90,6 +100,13 @@ class BaselineRun:
     log_handle: object = None
     message: str = ""
     supervisor: asyncio.Task | None = None
+    # Jobs parked in ``cancelling`` until this run is fully closed (worker
+    # exited and reaped, partial files and cancel flags removed).
+    gated_cancels: set[str] = field(default_factory=set)
+    # Set once, and only once, the teardown/publish path has finished.  This is
+    # distinct from ``event`` which may already be set while the worker is still
+    # alive (e.g. immediately when draining starts).
+    closed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class LimitExceededError(RuntimeError):
@@ -166,6 +183,16 @@ class JobManager:
         for task in supervisors:
             if not task.done():
                 task.cancel()
+
+        # Safety net: every process has been terminated above, so any job still
+        # parked in ``cancelling`` can be finalized now instead of lingering.
+        async with self._lock:
+            for job in jobs:
+                if job.state is JobState.CANCELLING:
+                    gated = job.baseline_run
+                    if gated is not None and job.id in gated.gated_cancels:
+                        gated.gated_cancels.discard(job.id)
+                    self._finalize_cancel_locked(job)
 
     def _clean_stale_jobs(self) -> None:
         jobs_dir = self.settings.jobs_dir
@@ -256,30 +283,44 @@ class JobManager:
     async def cancel(self, job_id: str) -> JobRecord:
         async with self._lock:
             job = self._jobs[job_id]
-            if job.terminal:
+            if job.terminal or job.state is JobState.CANCELLING:
+                # Terminal job: idempotent.  Cancelling job: teardown is
+                # already in flight; a repeated request must not shortcut it.
                 return job
             return await self._cancel_locked(job)
 
     async def _cancel_locked(self, job: JobRecord) -> JobRecord:
         """Mark/perform cancellation. Caller must hold the lock."""
-        if job.terminal:
+        if job.terminal or job.state is JobState.CANCELLING:
             return job
 
         # Detach from any shared baseline run first.
-        run = self._baseline_run
+        run = job.baseline_run
         if run is not None and job.id in run.waiters:
             run.waiters.discard(job.id)
             job.baseline_active = False
+
             if not run.waiters and run.status in (
                 BaselineStatus.STARTING,
                 BaselineStatus.RUNNING,
             ):
-                # Last waiter leaves: terminate and reclaim the real
-                # computation. The run drains; new jobs cannot attach.
+                # Last waiter leaves: the shared worker must be terminated and
+                # reaped and its artifacts cleaned before the job may become
+                # cancelled.  Park the job in ``cancelling`` and keep its slot.
+                job.state = JobState.CANCELLING
+                job.stage = JobStage.WAITING_BASELINE
+                job.message = (
+                    "cancellation requested; waiting for shared baseline "
+                    "process exit, reaping and cleanup"
+                )
+                job.updated_at = _utcnow()
+                run.gated_cancels.add(job.id)
                 await self._drain_baseline_run_locked(run)
+                return job
 
         if job.proc is None:
-            # Queued job with no own process: nothing to reap.
+            # Queued job with no own process and no shared run to wait for:
+            # nothing has to be reaped for this job, finalize immediately.
             self._finalize_cancel_locked(job)
             return job
 
@@ -295,9 +336,16 @@ class JobManager:
         return job
 
     async def _drain_baseline_run_locked(self, run: BaselineRun) -> None:
+        """Begin the last-waiter teardown of a shared baseline run.
+
+        Only marks the run as draining and arms termination; the actual
+        reaping/cleanup and ``closed`` event are produced by the baseline
+        supervisor, so parked cancelling jobs cannot be finalized early.
+        ``event`` is deliberately *not* set here: attached job supervisors must
+        wait for the completion event rather than a drain announcement.
+        """
         run.status = BaselineStatus.DRAINING
         run.message = "last waiter cancelled; terminating shared computation"
-        run.event.set()
         if run.proc is not None and run.proc.returncode is None:
             asyncio.create_task(
                 self._terminate(run.proc, run.cancel_file, run.id[:8]),
@@ -351,16 +399,46 @@ class JobManager:
         except Exception:  # noqa: BLE001
             LOG.exception("reap failed for worker %s", label)
 
-    def _finalize_cancel_locked(self, job: JobRecord) -> None:
-        """Only callable once the worker (if any) has exited."""
+    def _finalize_cancel_locked(self, job: JobRecord) -> bool:
+        """Finalize a cancellation when, and only when, it is safe.
+
+        Safe means: no own worker is alive and the shared baseline run the
+        cancellation was gated on (if any) has finished its exit/reap/cleanup.
+        Returns ``True`` when the job reached ``cancelled`` and ``False`` when
+        teardown is still in progress (caller must keep waiting).
+        """
         if job.state == JobState.CANCELLED:
-            return
-        assert job.proc is None or job.proc.returncode is not None
+            return True
+        if job.proc is not None and job.proc.returncode is None:
+            return False
+        run = job.baseline_run
+        if (
+            run is not None
+            and job.id in run.gated_cancels
+            and not run.closed.is_set()
+        ):
+            # The shared worker this job is bound to has not been reaped and
+            # cleaned up yet; keep the job ``cancelling`` and its slot held.
+            return False
         shutil.rmtree(job.target_path.parent, ignore_errors=True)
         job.state = JobState.CANCELLED
         job.message = "cancelled after worker exit and cleanup"
+        job.baseline_active = False
         job.updated_at = _utcnow()
         LOG.info("job %s cancelled and cleaned up", job.id)
+        return True
+
+    def _release_gated_cancels_locked(self, run: BaselineRun) -> None:
+        """Finalize parked cancelling jobs once the run is fully closed."""
+        for job_id in list(run.gated_cancels):
+            job = self._jobs.get(job_id)
+            if job is None or job.terminal:
+                continue
+            if not self._finalize_cancel_locked(job):
+                # Should not happen: closed was just set; keep the parked job
+                # until a later handoff finalizes it.
+                continue
+        run.gated_cancels.clear()
 
     # --------------------------------------------------------- job lifecycle
     async def _supervise_job(self, job_id: str) -> None:
@@ -398,7 +476,11 @@ class JobManager:
         except Exception as exc:  # noqa: BLE001
             LOG.exception("supervisor error for %s", job_id)
             async with self._lock:
-                if not job.terminal:
+                if job.state is JobState.CANCELLING:
+                    # Never turn a parked cancellation into an error; finalize
+                    # if no shared run teardown is pending anymore.
+                    self._finalize_cancel_locked(job)
+                elif not job.terminal:
                     job.state = JobState.ERROR
                     job.message = f"internal error: {exc}"
                     job.updated_at = _utcnow()
@@ -412,61 +494,89 @@ class JobManager:
         joins) a fresh run instead of inheriting the stale outcome.  Baseline
         failures are retried a bounded number of times before erroring the job,
         so a persistently broken baseline cannot spin forever.
+
+        A job parked in ``cancelling`` by a last-waiter drain stays parked until
+        that run's ``closed`` event fires (worker reaped + artifacts cleaned);
+        only then may it become ``cancelled``.
         """
         max_attempts = 2
         attached_run: BaselineRun | None = None
         while True:
             async with self._lock:
-                if job.state in (
-                    JobState.CANCELLING,
-                    JobState.CANCELLED,
-                ):
-                    if not job.terminal:
-                        self._finalize_cancel_locked(job)
+                if job.terminal:
                     return False
-                if self.baseline_climatology_ready():
+                if job.state is JobState.CANCELLING:
+                    parked_run = job.baseline_run
+                    if (
+                        parked_run is not None
+                        and job.id in parked_run.gated_cancels
+                        and not parked_run.closed.is_set()
+                    ):
+                        # Teardown still in progress: do not finalize, do not
+                        # attach to any other run, keep the slot occupied.
+                        closed_event = parked_run.closed
+                    else:
+                        self._finalize_cancel_locked(job)
+                        return False
+                elif self.baseline_climatology_ready():
                     job.stage = JobStage.ANOMALY
                     job.baseline_active = False
+                    if job.baseline_run is not None:
+                        job.baseline_run.waiters.discard(job.id)
+                        job.baseline_run = None
                     job.message = "baseline climatology available"
                     job.updated_at = _utcnow()
                     return True
-
-                run = self._baseline_run
-                stale = (
-                    run is not None
-                    and run.status
-                    not in (BaselineStatus.STARTING, BaselineStatus.RUNNING)
-                )
-                if run is None or stale or run is attached_run:
-                    # The run we were attached to ended without publishing, or
-                    # no usable run exists: never join a draining/old run.
-                    if stale:
-                        self._baseline_run = None
-                    job.baseline_attempts += 1
-                    run = self._spawn_baseline_run_locked()
-                if job.id not in run.waiters:
-                    run.waiters.add(job.id)
-                    job.baseline_active = True
-                    job.message = (
-                        f"shared baseline run {run.id[:8]} in progress"
+                else:
+                    run = self._baseline_run
+                    stale = (
+                        run is not None
+                        and run.status
+                        not in (
+                            BaselineStatus.STARTING,
+                            BaselineStatus.RUNNING,
+                        )
                     )
-                    job.updated_at = _utcnow()
-                attached_run = run
-                event = run.event
+                    if run is None or stale or run is attached_run:
+                        # The run we were attached to ended without publishing,
+                        # or no usable run exists: never join a draining/old run.
+                        if stale:
+                            self._baseline_run = None
+                        if attached_run is not None:
+                            attached_run.waiters.discard(job.id)
+                        job.baseline_attempts += 1
+                        run = self._spawn_baseline_run_locked()
+                    if job.id not in run.waiters:
+                        run.waiters.add(job.id)
+                        job.baseline_run = run
+                        job.baseline_active = True
+                        job.message = (
+                            f"shared baseline run {run.id[:8]} in progress"
+                        )
+                        job.updated_at = _utcnow()
+                    attached_run = run
+                    closed_event = None
 
-            await event.wait()
+            if closed_event is not None:
+                await closed_event.wait()
+                continue
+
+            await attached_run.event.wait()
 
             async with self._lock:
                 if job.terminal:
                     return False
-                if job.state == JobState.CANCELLING:
-                    # The last-waiter drain woke us; honor cancellation rather
-                    # than misreporting the terminated shared run as an error.
-                    self._finalize_cancel_locked(job)
-                    return False
+                if job.state is JobState.CANCELLING:
+                    # Loop back: the top of the loop either parks until the run
+                    # is closed or finalizes once the teardown completed.  Never
+                    # finalize a parked last-waiter cancel here.
+                    continue
                 if self.baseline_climatology_ready():
                     job.stage = JobStage.ANOMALY
                     job.baseline_active = False
+                    if job.baseline_run is not None:
+                        job.baseline_run.waiters.discard(job.id)
+                        job.baseline_run = None
                     job.message = "baseline climatology available"
                     job.updated_at = _utcnow()
                     return True
@@ -499,7 +609,8 @@ class JobManager:
         self, job: JobRecord
     ) -> asyncio.subprocess.Process | None:
         async with self._lock:
-            if job.state == JobState.CANCELLING or job.state == JobState.CANCELLED:
+            if job.state in (JobState.CANCELLING, JobState.CANCELLED):
+                # A cancelled job may never enter the anomaly phase.
                 if not job.terminal:
                     self._finalize_cancel_locked(job)
                 return None
@@ -608,59 +719,110 @@ class JobManager:
                 if self._shutdown or run.status == BaselineStatus.DRAINING:
                     # Last-waiter cancel raced the spawn: never start the
                     # actual computation, just finalize the empty run.
-                    run.status = BaselineStatus.TERMINATED
-                    run.message = "terminated before worker start"
-                    run.event.set()
-                    self._safe_close(run.log_handle)
-                    run.cancel_file.unlink(missing_ok=True)
+                    self._close_baseline_run_locked(
+                        run,
+                        BaselineStatus.TERMINATED,
+                        "terminated before worker start",
+                        clean_artifacts=False,
+                    )
                     return
                 proc = await spawn()
                 run.proc = proc
-                run.status = BaselineStatus.RUNNING
-                run.message = "shared climatology worker running"
+                if run.status == BaselineStatus.DRAINING:
+                    # The cancel landed while the subprocess was being created.
+                    # Arm termination immediately; the reap path below closes
+                    # the run and releases the parked cancelling waiters.
+                    run.message = "shared worker spawned while draining"
+                    if proc.returncode is None:
+                        asyncio.create_task(
+                            self._terminate(
+                                proc, run.cancel_file, run.id[:8]
+                            ),
+                            name=f"kill-base-{run.id[:8]}",
+                        )
+                else:
+                    run.status = BaselineStatus.RUNNING
+                    run.message = "shared climatology worker running"
         except Exception as exc:  # noqa: BLE001
             LOG.exception("baseline spawn failed")
             async with self._lock:
                 if run.status == BaselineStatus.DRAINING:
-                    run.status = BaselineStatus.TERMINATED
-                    run.message = "terminated during spawn"
+                    self._close_baseline_run_locked(
+                        run,
+                        BaselineStatus.TERMINATED,
+                        "terminated during spawn",
+                        clean_artifacts=False,
+                    )
                 else:
-                    run.status = BaselineStatus.ERROR
-                    run.message = f"spawn failed: {exc}"
-                run.event.set()
-                self._safe_close(run.log_handle)
-                run.cancel_file.unlink(missing_ok=True)
+                    self._close_baseline_run_locked(
+                        run,
+                        BaselineStatus.ERROR,
+                        f"spawn failed: {exc}",
+                        clean_artifacts=True,
+                    )
             return
 
         rc = await proc.wait()
 
         async with self._lock:
-            self._safe_close(run.log_handle)
             if run.status == BaselineStatus.DRAINING:
-                # Cancellation won the race: no publish, clean artifacts.
-                run.status = BaselineStatus.TERMINATED
-                run.message = "shared computation terminated on last cancel"
-                run.part_path.unlink(missing_ok=True)
-                run.cancel_file.unlink(missing_ok=True)
-                run.event.set()
+                # Cancellation won the race: no publish, clean artifacts. The
+                # run closes only here -- after the worker has exited and been
+                # reaped -- so parked cancelling jobs become ``cancelled`` only
+                # at this point.
+                self._close_baseline_run_locked(
+                    run,
+                    BaselineStatus.TERMINATED,
+                    "shared computation terminated on last cancel",
+                    clean_artifacts=True,
+                )
                 LOG.warning("baseline run %s terminated (rc=%s)", run.id, rc)
                 return
             if rc == 0 and run.part_path.is_file():
                 # Atomic publication; until this replace happens, jobs keep
                 # waiting, so a late file can never be consumed.
                 run.part_path.replace(run.output_path)
-                run.status = BaselineStatus.DONE
-                run.message = "climatology published"
-                run.event.set()
-                run.cancel_file.unlink(missing_ok=True)
+                self._close_baseline_run_locked(
+                    run,
+                    BaselineStatus.DONE,
+                    "climatology published",
+                    clean_artifacts=False,
+                )
                 LOG.info("baseline run %s published climatology", run.id)
                 return
-            run.status = BaselineStatus.ERROR
-            run.message = f"baseline worker exited with code {rc}"
-            run.part_path.unlink(missing_ok=True)
-            run.cancel_file.unlink(missing_ok=True)
-            run.event.set()
+            self._close_baseline_run_locked(
+                run,
+                BaselineStatus.ERROR,
+                f"baseline worker exited with code {rc}",
+                clean_artifacts=True,
+            )
             LOG.error("baseline run %s failed rc=%s", run.id, rc)
+
+    def _close_baseline_run_locked(
+        self,
+        run: BaselineRun,
+        status: BaselineStatus,
+        message: str,
+        clean_artifacts: bool,
+    ) -> None:
+        """Single terminal transition for a baseline run.
+
+        Closes the log, optionally removes the partial output and cooperative
+        cancel flag, records the terminal state and then -- and only then --
+        marks the run closed and releases parked last-waiter cancellations.
+        The part/cancel file names carry the run id, so an older run's teardown
+        can never touch a newer run's files or another job's directory.
+        """
+        self._safe_close(run.log_handle)
+        if clean_artifacts:
+            run.part_path.unlink(missing_ok=True)
+        # The cancel flag belongs to this run only; keep cleanup scoped to it.
+        run.cancel_file.unlink(missing_ok=True)
+        run.status = status
+        run.message = message
+        run.event.set()
+        run.closed.set()
+        self._release_gated_cancels_locked(run)
 
     # ---------------------------------------------------------------- helpers
     @staticmethod

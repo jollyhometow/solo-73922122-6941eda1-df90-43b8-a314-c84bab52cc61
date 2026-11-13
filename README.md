@@ -20,11 +20,14 @@
 | 最多受理两份未结束任务 | `MAX_ACTIVE_JOBS=2`，超出返回 **409**，终态任务释放名额 |
 | 并发任务共用未完成的基准计算 | 首个任务创建一个 `BaselineRun`，后续任务挂接同一进程的等待者集合 |
 | 取消一份不影响其余 | 仅从等待者集合移除；仍有等待者时共享进程不终止 |
-| 最后等待者取消须终止并回收 | 共享进程进入 `draining`，终止实际计算、回收进程、删除临时/成品文件，运行标记 `terminated` |
+| 最后等待者取消须终止并回收 | 任务保持 `cancelling` 且继续占用名额；共享进程进入 `draining`，终止实际计算、回收进程、删除临时/取消文件，运行标记 `terminated` 后任务才转为 `cancelled` 并删除任务目录 |
+| 重复取消不得提前收尾 | `cancelling` 期间再次取消为幂等空操作，只有基准进程退出/回收/清理完成后才允许 `cancelled` |
+| 已取消任务不进入距平、不提供结果 | 阶段闸门阻止进入 anomaly；下载接口对非 `done` 任务一律 409，即使磁盘上瞬时存在文件 |
+| 收尾中可查状态、用剩余名额提交新任务 | `cancelling` 仍计入未结束名额，状态可轮询；新任务不挂接 `draining/terminated/error/done` 运行，另起新运行；旧收尾只清理带自身 run id 的文件，不会清掉或改写新任务 |
 | 收尾中新任务不得加入旧计算 | 仅 `starting/running` 可挂接；`draining/terminated/error/done` 一律不挂接，新任务另起新运行 |
 | 距平在独立进程计算 | `python -I -m app.worker` 子进程，与 Web 进程隔离 |
 | 取消与阶段交接/完成交错不启动后续阶段、不发布迟到结果 | 子进程在每个切片与**每个阶段边界**检查取消标志；发布前再检查一次；取消时删除任何 `.part`/成品并以 143 退出 |
-| 退出并清理后才报已取消 | 管理器等待子进程退出（reap）并删除任务目录后，才把状态置为 `cancelled` |
+| 退出并清理后才报已取消 | 管理器等待所属工作器（含最后等待者对应的共享基准子进程）退出（reap）并完成文件清理后，才把状态置为 `cancelled` |
 | 可实际启动的 Docker Compose | 见下文，含健康检查与持久化卷 |
 | 虚构气温与可控慢计算样例 | `scripts/generate_samples.py` 生成数据；`SLOW_STEP_DELAY/SLOW_STEPS` 控制可中断的慢计算 |
 
@@ -54,6 +57,9 @@ JobManager (app/manager.py)
 
 - 任务：`queued → running → done`；取消路径 `queued/running → cancelling → cancelled`；失败 `→ error`。
 - 基准运行：`starting → running → done`；最后等待者取消：`running → draining → terminated`；异常 `→ error`。
+- 最后等待者取消的严格顺序：任务进入 `cancelling`（占名额）→ 共享工作器终止并被 `wait()` 回收 →
+  该 run 的 `.part`/取消标志清理、状态置 `terminated` 且 `closed` 事件触发 → 任务才置 `cancelled`
+  并删除任务目录、释放名额。期间任何重复取消都只是幂等返回，不会跳过等待。
 
 **两道取消通道**（保证在受限环境也能演示）
 
@@ -120,9 +126,25 @@ docker compose down -v        # 删除卷，下次启动重新生成
    - a 很快变为 `cancelled`（子进程已退出、目录已清理）；
    - 共享基准仍是 `running`，b 不受影响继续等待并最终 `done`。
 6. 重新开两份任务，在基准完成前**依次取消，最后取消最后一个等待者**：
+   - 最后等待者先保持 `cancelling` 并占住名额（状态可继续轮询），重复点击取消不会提前收尾；
    - 共享运行变为 `draining → terminated`，气候态文件与 `.part` 被删除；
-   - 此后再提交新任务，会生成一个**全新 run id** 的运行，绝不加入旧计算。
-7. 对 `done` 任务点「下载距平 NetCDF」，文件名 `<原名>_anomaly.nc`。
+   - 仅在进程退出、回收与清理完成后，任务才变为 `cancelled` 并释放名额；
+   - 收尾期间用剩余名额提交新任务，会生成一个**全新 run id** 的运行，绝不加入旧计算，旧收尾也不会清掉或改写新任务。
+7. 对 `done` 任务点「下载距平 NetCDF」，文件名 `<原名>_anomaly.nc`；`cancelled/cancelling` 任务的下载返回 409。
+
+### 5.1 一键可控演示脚本（共享基准尚未回收时的重复取消 + 新任务提交）
+
+服务启动后运行（仅依赖标准库，可在容器外或容器内执行）：
+
+```bash
+# 对 docker compose 暴露的本机 8000 端口
+python -I -m scripts.demo_cancel_teardown --base-url http://localhost:8000
+```
+
+脚本自动完成 8 个带断言的步骤：双任务挂接同一基准 → 取消其一不影响共享计算 →
+最后等待者进入 `cancelling` 且基准 `draining` → 重复取消保持 `cancelling` 且名额不释放 →
+用剩余名额提交新任务并确认另起 run id → 旧运行回收清理后最后等待者才 `cancelled` →
+新任务正常完成并可下载 → 已取消任务下载返回 409。
 
 命令行等价演示：
 
@@ -147,8 +169,8 @@ curl -OJ http://localhost:8000/api/jobs/<id>/download
 | POST | `/api/jobs` | multipart 上传字段 `file`，201 受理；400 校验失败；409 超并发 |
 | GET | `/api/jobs` | 全部任务与活跃计数 |
 | GET | `/api/jobs/{id}` | 单任务状态 |
-| POST | `/api/jobs/{id}/cancel` | 请求取消（终态任务幂等） |
-| GET | `/api/jobs/{id}/download` | 下载距平 NetCDF（非 done 返回 409） |
+| POST | `/api/jobs/{id}/cancel` | 请求取消（终态任务幂等；`cancelling` 中重复请求为空操作） |
+| GET | `/api/jobs/{id}/download` | 下载距平 NetCDF（仅 `done` 返回 200，其余状态返回 409） |
 
 任务状态：`queued / running / cancelling / done / error / cancelled`。
 
@@ -174,15 +196,17 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-39 个测试覆盖：
+43 个测试覆盖：
 
 - 数据契约校验（重复时间、非月初、非公历日历、非开尔文、网格不一致、维度顺序、额外变量、非单调坐标、整型 tas、损坏文件）；
 - 气候态忽略缺测、距平数值、无基准月→NaN、坐标逐字保留；
 - 子进程 CLI 正常路径、SIGTERM/取消文件两条取消通道、启动窗口取消、无残留文件；
 - 管理器：端到端、两份共享一个基准进程、409 上限、取消单个不影响其余、
-  最后等待者取消终止回收且新任务不加入旧运行、距平阶段取消回收、
+  最后等待者取消终止回收且新任务不加入旧运行、**最后等待者在基准进程回收清理前保持
+  `cancelling` 且占住名额、重复取消不提前收尾、收尾中新任务另起基准且不被旧收尾清掉/改写、
+  已取消任务不进入距平阶段也不提供结果**、距平阶段取消回收、
   完成与取消交错不发布迟到结果、基准失败报错、关闭时回收全部进程；
-- HTTP 层完整上传/状态/取消/下载流程。
+- HTTP 层完整上传/状态/取消/下载流程（含已取消任务下载 409）。
 
 > 注：本开发沙箱的 seccomp 禁止 `kill(2)`，信号相关用例自动改走取消文件通道；
 > 在普通 Docker 容器内则走真实 SIGTERM，两条路径均在 CI 风格的测试中验证。
@@ -202,7 +226,8 @@ app/
   main.py              FastAPI 路由
   templates/index.html 演示网页
 scripts/
-  generate_samples.py  生成虚构基准与样例
+  generate_samples.py      生成虚构基准与样例
+  demo_cancel_teardown.py  最后等待者取消/重复取消/新任务提交的可控演示（标准库实现）
 docker/
   entrypoint.sh        容器入口（按需生成样例后启动服务）
 tests/                 pytest 测试

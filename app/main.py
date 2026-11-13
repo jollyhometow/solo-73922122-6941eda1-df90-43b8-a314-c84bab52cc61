@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from .config import Settings
 from .manager import JobManager, JobNotFoundError, LimitExceededError
+from .models import JobState
 from .netcdf_io import DatasetError
 
 logger = logging.getLogger("web")
@@ -153,7 +154,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             job = manager.get_job(job_id)
         except JobNotFoundError as exc:
             raise HTTPException(status_code=404, detail="job not found") from exc
-        if not job.output_path.is_file():
+        # A cancelled/cancelling job must never provide a result, even if a
+        # late output file were momentarily present on disk.
+        if job.state is not JobState.DONE or not job.output_path.is_file():
             raise HTTPException(
                 status_code=409,
                 detail=f"job is '{job.state.value}': no result file available",

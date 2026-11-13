@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -186,6 +187,8 @@ async def test_cancel_last_waiter_terminates_baseline(
         await manager.cancel(a.id)
         await wait_until(lambda: a.state is JobState.CANCELLED, timeout=10)
         await manager.cancel(b.id)
+        # The last waiter stays cancelling until the shared process is reaped.
+        assert b.state is JobState.CANCELLING
 
         # Process must be reaped, run terminated, artifacts cleaned.
         await wait_until(
@@ -195,7 +198,8 @@ async def test_cancel_last_waiter_terminates_baseline(
         assert run.proc.pid == pid
         assert not settings.baseline_work_path.exists()
         assert not run.part_path.exists()
-        assert b.state is JobState.CANCELLED
+        await wait_until(lambda: b.state is JobState.CANCELLED, timeout=10)
+        assert not b.target_path.parent.exists()
 
         # A later submission must NOT attach to the terminated/draining run.
         # It may briefly observe the draining slot before spawning a fresh
@@ -217,6 +221,189 @@ async def test_cancel_last_waiter_terminates_baseline(
         await wait_until(_fresh_run_or_done, timeout=15)
         await wait_until(lambda: c.state is JobState.DONE, timeout=60)
         assert settings.baseline_work_path.is_file()
+    finally:
+        await manager.shutdown()
+
+
+async def test_last_waiter_stays_cancelling_until_baseline_reaped(
+    settings, baseline_file, target_file
+):
+    # Regression: the last waiting job used to show ``cancelled`` (directory
+    # removed, slot released) while the shared baseline process was still alive.
+    manager = await _start(settings)
+    try:
+        a = await _submit(manager, target_file, "a.nc")
+        b = await _submit(manager, target_file, "b.nc")
+        await wait_until(
+            lambda: manager._baseline_run is not None
+            and manager._baseline_run.status is BaselineStatus.RUNNING,
+            timeout=10,
+        )
+        run = manager._baseline_run
+
+        # a still has another waiter behind it: shared computation survives.
+        await manager.cancel(a.id)
+        await wait_until(lambda: a.state is JobState.CANCELLED, timeout=10)
+        assert run.status is BaselineStatus.RUNNING
+        assert run.proc.returncode is None
+
+        # Last waiter: must be parked in cancelling and keep occupying a slot
+        # while the shared worker is still alive.
+        await manager.cancel(b.id)
+        assert b.state is JobState.CANCELLING
+        assert b.active  # slot still held
+        active = sum(1 for j in manager._jobs.values() if j.active)
+        assert active == 1
+        # Directory must not be removed before the run is reaped.
+        assert b.target_path.parent.exists()
+        assert run.status is BaselineStatus.DRAINING
+
+        # Repeated cancels must be no-ops and cannot finish the teardown early.
+        again = await manager.cancel(b.id)
+        assert again.state is JobState.CANCELLING
+        assert again is b
+        assert run.status is BaselineStatus.DRAINING
+        assert b.target_path.parent.exists()
+
+        # Only after exit + reap + cleanup may the job become cancelled.
+        await wait_until(lambda: run.status is BaselineStatus.TERMINATED, timeout=15)
+        assert run.closed.is_set()
+        assert run.proc.returncode is not None
+        await wait_until(lambda: b.state is JobState.CANCELLED, timeout=10)
+        assert not b.target_path.parent.exists()
+        assert not run.part_path.exists()
+        assert not settings.baseline_work_path.exists()
+    finally:
+        await manager.shutdown()
+
+
+async def test_new_job_during_drain_starts_own_baseline_and_is_not_clobbered(
+    settings, baseline_file, target_file
+):
+    # While the last-waiter teardown is still in flight, the remaining slot
+    # accepts a new job that starts a fresh baseline run; the old teardown must
+    # never delete or overwrite the new job's files.
+    manager = await _start(settings)
+    try:
+        a = await _submit(manager, target_file, "a.nc")
+        b = await _submit(manager, target_file, "b.nc")
+        await wait_until(
+            lambda: manager._baseline_run is not None
+            and manager._baseline_run.status is BaselineStatus.RUNNING,
+            timeout=10,
+        )
+        old_run = manager._baseline_run
+
+        await manager.cancel(a.id)
+        await wait_until(lambda: a.state is JobState.CANCELLED, timeout=10)
+        await manager.cancel(b.id)
+        assert b.state is JobState.CANCELLING
+
+        # One slot is still free: a fresh submission is accepted.
+        c = await _submit(manager, target_file, "c.nc")
+        assert c.id not in old_run.waiters
+        c_dir = c.target_path.parent
+        assert c_dir.exists()
+
+        async def _fresh_run():
+            current = manager._baseline_run
+            return current is not None and current is not old_run
+
+        await wait_until(_fresh_run, timeout=15)
+        new_run = manager._baseline_run
+        assert new_run is not old_run
+        assert new_run.status in (
+            BaselineStatus.STARTING,
+            BaselineStatus.RUNNING,
+        )
+        assert old_run.part_path != new_run.part_path
+        assert old_run.cancel_file != new_run.cancel_file
+
+        # Repeated cancel of the old job while both runs coexist.
+        await manager.cancel(b.id)
+        assert b.state is JobState.CANCELLING
+
+        await wait_until(
+            lambda: old_run.status is BaselineStatus.TERMINATED, timeout=15
+        )
+        await wait_until(lambda: b.state is JobState.CANCELLED, timeout=10)
+
+        # Old teardown left the new job's directory and artifacts untouched.
+        assert c_dir.exists()
+        assert c.target_path.is_file()
+        if new_run.proc is not None and new_run.proc.returncode is None:
+            pass  # new baseline still legitimately running
+
+        await wait_until(lambda: c.state is JobState.DONE, timeout=60)
+        assert c.output_path.is_file()
+        assert settings.baseline_work_path.is_file()
+    finally:
+        await manager.shutdown()
+
+
+async def test_cancelled_job_never_enters_anomaly_or_serves_result(
+    settings, baseline_file, target_file
+):
+    manager = await _start(settings)
+    try:
+        job = await _submit(manager, target_file, "a.nc")
+        await wait_until(
+            lambda: manager._baseline_run is not None,
+            timeout=10,
+        )
+        await manager.cancel(job.id)
+        await wait_until(lambda: job.terminal, timeout=20)
+        assert job.state is JobState.CANCELLED
+        assert job.proc is None  # never launched an anomaly worker
+        assert not job.output_path.exists()
+        assert not job.target_path.parent.exists()
+        assert manager.baseline_climatology_ready() is False
+    finally:
+        await manager.shutdown()
+
+
+async def test_repeated_cancel_hammer_during_drain_never_finalizes_early(
+    settings, baseline_file, target_file
+):
+    manager = await _start(settings)
+    try:
+        jobs = [await _submit(manager, target_file, f"{i}.nc") for i in range(2)]
+        await wait_until(
+            lambda: manager._baseline_run is not None
+            and manager._baseline_run.status is BaselineStatus.RUNNING,
+            timeout=10,
+        )
+        old_run = manager._baseline_run
+        for job in jobs:
+            await manager.cancel(job.id)
+
+        last = jobs[-1]
+        assert last.state is JobState.CANCELLING
+
+        # Hammer cancel while the shared worker is still being reaped.  None of
+        # these calls may finalize the job or release its slot.
+        for _ in range(5):
+            again = await manager.cancel(last.id)
+            assert again.state is JobState.CANCELLING
+            assert last.target_path.parent.exists()
+            await asyncio.sleep(0)
+
+        # The remaining slot stays usable throughout the teardown.
+        new_job = await _submit(manager, target_file, "new.nc")
+        await wait_until(
+            lambda: manager._baseline_run is not None
+            and manager._baseline_run is not old_run,
+            timeout=15,
+        )
+
+        await wait_until(lambda: old_run.closed.is_set(), timeout=15)
+        await wait_until(lambda: last.state is JobState.CANCELLED, timeout=10)
+        assert not last.target_path.parent.exists()
+
+        # The interleaved job must survive the old teardown untouched.
+        assert new_job.target_path.is_file()
+        await wait_until(lambda: new_job.state is JobState.DONE, timeout=60)
+        assert new_job.output_path.is_file()
     finally:
         await manager.shutdown()
 

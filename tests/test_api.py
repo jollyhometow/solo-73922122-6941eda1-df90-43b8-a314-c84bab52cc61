@@ -107,6 +107,29 @@ async def test_cancel_flow_over_http(
     assert r.status_code == 404
 
 
+async def test_cancelled_job_never_serves_a_download(
+    client: httpx.AsyncClient, target_file: Path
+):
+    with target_file.open("rb") as fh:
+        r = await client.post(
+            "/api/jobs", files={"file": ("a.nc", fh, "application/x-netcdf")}
+        )
+    job_id = r.json()["id"]
+    await client.post(f"/api/jobs/{job_id}/cancel")
+
+    async def _terminal():
+        poll = await client.get(f"/api/jobs/{job_id}")
+        return poll.json()["state"] in ("cancelled", "done", "error")
+
+    await wait_until(_terminal, timeout=30)
+    state = (await client.get(f"/api/jobs/{job_id}")).json()["state"]
+    assert state == "cancelled"
+
+    # A cancelled job must never provide a result, even if a file is on disk.
+    r = await client.get(f"/api/jobs/{job_id}/download")
+    assert r.status_code == 409
+
+
 async def test_limit_returns_409(client: httpx.AsyncClient, target_file: Path):
     ids = []
     for _ in range(2):

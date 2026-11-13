@@ -96,7 +96,9 @@
       <tbody id="jobs"><tr><td colspan="5" class="msg">暂无任务</td></tr></tbody>
     </table>
     <p class="hint">演示：连续提交两份任务可在“消息”列看到它们挂接同一个共享基准运行；
-      基准完成前取消其中一份不会影响另一份；取消最后一份等待者会终止并回收基准计算。</p>
+      基准完成前取消其中一份不会影响另一份；取消最后一份等待者时，任务保持
+      <code>cancelling</code> 并继续占住名额，直到所属共享基准进程退出、被回收且清理完成，
+      才显示 <code>cancelled</code>；收尾期间重复取消不会提前结束，仍可用剩余名额提交新任务。</p>
   </section>
 
   <section class="panel samples">
